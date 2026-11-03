@@ -15,9 +15,16 @@ st.set_page_config(
     layout="centered",
 )
 
-PRIMARY_MODEL = "gemini-2.5-flash"
-FALLBACK_MODEL = "gemini-2.5-flash-lite"
+# Models are tried in order. If one is busy (503) or retired (404), the app
+# moves on to the next. Check https://ai.google.dev/gemini-api/docs/models
+# for current names and update this list when models change.
+MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+]
 RETRYABLE_CODES = {429, 500, 503, 504}
+SKIP_MODEL_CODES = {404}
 
 
 # ---------------------------------------------------------------------------
@@ -76,10 +83,10 @@ and do not invent URLs. Name resources by title and author or platform instead.
 """.strip()
 
 
-def generate_with_retry(client, prompt: str, max_retries: int = 4) -> str:
-    """Call Gemini with exponential backoff, then fall back to a lighter model."""
+def generate_with_retry(client, prompt: str, max_retries: int = 3) -> str:
+    """Call Gemini with exponential backoff, falling back through MODELS."""
     last_error = None
-    for model in (PRIMARY_MODEL, FALLBACK_MODEL):
+    for model in MODELS:
         for attempt in range(max_retries):
             try:
                 response = client.models.generate_content(model=model, contents=prompt)
@@ -88,10 +95,11 @@ def generate_with_retry(client, prompt: str, max_retries: int = 4) -> str:
                 raise RuntimeError("The model returned an empty response.")
             except errors.APIError as err:
                 last_error = err
+                if err.code in SKIP_MODEL_CODES:
+                    break  # model retired or unavailable: try the next one
                 if err.code not in RETRYABLE_CODES:
                     raise
-                delay = (2 ** attempt) + random.random()
-                time.sleep(delay)
+                time.sleep((2 ** attempt) + random.random())
     raise last_error if last_error else RuntimeError("Unknown error")
 
 
