@@ -4,7 +4,7 @@ import random
 
 import streamlit as st
 from google import genai
-from google.genai import errors
+from google.genai import errors, types
 
 # ---------------------------------------------------------------------------
 # Page setup
@@ -83,31 +83,40 @@ and do not invent URLs. Name resources by title and author or platform instead.
 """.strip()
 
 
-def generate_with_retry(client, prompt: str, max_retries: int = 3) -> str:
-    """Call Gemini with exponential backoff, falling back through MODELS."""
-    last_error = None
+REQUEST_TIMEOUT_MS = 90_000  # a single request may not hang longer than 90 s
+
+
+def generate_with_retry(client, prompt: str, on_status=None, log=None) -> str:
+    """Try each model in order. Busy models get 2 attempts; timeouts and
+    retired models move on to the next model immediately."""
+    log = log if log is not None else []
     for model in MODELS:
-        for attempt in range(max_retries):
+        for attempt in range(2):
+            if on_status:
+                on_status(f"Asking `{model}` (attempt {attempt + 1})...")
             try:
                 response = client.models.generate_content(model=model, contents=prompt)
                 if response.text:
                     return response.text
-                raise RuntimeError("The model returned an empty response.")
+                log.append(f"{model}: empty response")
+                break
             except errors.APIError as err:
-                last_error = err
-                if err.code in SKIP_MODEL_CODES:
-                    break  # model retired or unavailable: try the next one
-                if err.code not in RETRYABLE_CODES:
-                    raise
-                time.sleep((2 ** attempt) + random.random())
-    raise last_error if last_error else RuntimeError("Unknown error")
+                log.append(f"{model}: API error {err.code} - {str(err.message)[:150]}")
+                if err.code in RETRYABLE_CODES and attempt == 0:
+                    time.sleep(2 + random.random())
+                    continue
+                break  # retired (404), still busy, or a hard error: next model
+            except Exception as err:  # timeouts, network problems
+                log.append(f"{model}: {type(err).__name__} - {str(err)[:150]}")
+                break
+    raise RuntimeError("All models failed.")
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_roadmap(api_key: str, topic: str, level: str, hours: int, weeks: int, goal: str) -> str:
-    client = genai.Client(api_key=api_key)
-    prompt = build_prompt(topic, level, hours, weeks, goal)
-    return generate_with_retry(client, prompt)
+def make_client(api_key: str):
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +160,33 @@ if submitted:
         st.warning("Please enter a topic.")
         st.stop()
 
-    with st.spinner("Building your roadmap... this can take up to a minute."):
-        try:
-            roadmap = get_roadmap(api_key, topic.strip(), level, hours, weeks, goal)
-        except errors.APIError as err:
-            if err.code in RETRYABLE_CODES:
-                st.error("The AI service is busy right now. Please try again in a minute.")
-            else:
-                st.error(f"API error ({err.code}): {err.message}")
-            st.stop()
-        except Exception as err:
-            st.error(f"Something went wrong: {err}")
-            st.stop()
+    cache_key = (topic.strip(), level, hours, weeks, goal.strip())
+    cache = st.session_state.setdefault("roadmap_cache", {})
+    roadmap = cache.get(cache_key)
+    log: list[str] = []
+
+    if roadmap is None:
+        with st.status("Building your roadmap...", expanded=True) as status:
+            try:
+                client = make_client(api_key)
+                prompt = build_prompt(topic.strip(), level, hours, weeks, goal)
+                roadmap = generate_with_retry(
+                    client, prompt, on_status=lambda m: status.write(m), log=log
+                )
+                cache[cache_key] = roadmap
+                status.update(label="Roadmap ready!", state="complete", expanded=False)
+            except Exception:
+                status.update(label="Could not generate the roadmap", state="error")
+
+    if roadmap is None:
+        st.error(
+            "Every model failed. This is usually a temporary overload, a rate limit, "
+            "an invalid API key, or an outdated model name. Details below."
+        )
+        with st.expander("🔍 Diagnostic details"):
+            for line in log:
+                st.code(line)
+        st.stop()
 
     st.success(f"Your {level} roadmap: {hours} h/week for {weeks} weeks")
     st.markdown(roadmap)
